@@ -248,7 +248,7 @@ public class UserResource {
             userOpt = userRepository.findById(Long.parseLong(id));
         }
         if (userOpt.isPresent()) {
-            User targetUser = userOpt.get();
+            User targetUser = userOpt.orElseThrow();
             // Soft-delete: deactivate instead of hard delete
             targetUser.setActivated(false);
             userRepository.save(targetUser);
