@@ -1,0 +1,422 @@
+package hospital.web.rest;
+
+import hospital.domain.Appointment;
+import hospital.domain.Doctor;
+import hospital.domain.Hospital;
+import hospital.domain.Specialty;
+import hospital.domain.enumeration.AppointmentStatus;
+import hospital.repository.AppointmentRepository;
+import hospital.repository.DoctorRepository;
+import hospital.repository.HospitalRepository;
+import hospital.repository.PaymentRepository;
+import hospital.repository.SpecialtyRepository;
+import hospital.repository.UserRepository;
+import hospital.service.NotificationService;
+import hospital.service.dto.PageResponseDTO;
+import hospital.service.dto.PaginationDTO;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import java.time.LocalDate;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/api/admin")
+public class AdminResource {
+
+    private final UserRepository userRepository;
+    private final DoctorRepository doctorRepository;
+    private final SpecialtyRepository specialtyRepository;
+    private final HospitalRepository hospitalRepository;
+    private final AppointmentRepository appointmentRepository;
+    private final PaymentRepository paymentRepository;
+    private final NotificationService notificationService;
+
+    public AdminResource(
+        UserRepository userRepository,
+        DoctorRepository doctorRepository,
+        SpecialtyRepository specialtyRepository,
+        HospitalRepository hospitalRepository,
+        AppointmentRepository appointmentRepository,
+        PaymentRepository paymentRepository,
+        NotificationService notificationService
+    ) {
+        this.userRepository = userRepository;
+        this.doctorRepository = doctorRepository;
+        this.specialtyRepository = specialtyRepository;
+        this.hospitalRepository = hospitalRepository;
+        this.appointmentRepository = appointmentRepository;
+        this.paymentRepository = paymentRepository;
+        this.notificationService = notificationService;
+    }
+
+    @GetMapping("/dashboard")
+    public ResponseEntity<Map<String, Object>> dashboard() {
+        List<Appointment> allAppointments = appointmentRepository.findAll();
+        LocalDate startOfMonth = LocalDate.now().withDayOfMonth(1);
+
+        long totalRevenue = paymentRepository
+            .findAll()
+            .stream()
+            .filter(p -> "SUCCESS".equalsIgnoreCase(p.getStatus()))
+            .mapToLong(p -> p.getAmount() == null ? 0L : p.getAmount())
+            .sum();
+
+        long monthlyRevenue = paymentRepository
+            .findAll()
+            .stream()
+            .filter(p -> "SUCCESS".equalsIgnoreCase(p.getStatus()) && p.getCreatedAt() != null &&
+                !p.getCreatedAt().isBefore(startOfMonth.atStartOfDay().toInstant(java.time.ZoneOffset.UTC)))
+            .mapToLong(p -> p.getAmount() == null ? 0L : p.getAmount())
+            .sum();
+
+        long monthlyAppointments = allAppointments.stream()
+            .filter(a -> a.getAppointmentDate() != null && !a.getAppointmentDate().isBefore(startOfMonth))
+            .count();
+
+        Map<String, Object> statistics = new LinkedHashMap<>();
+        statistics.put("totalUsers", userRepository.count());
+        statistics.put("totalDoctors", doctorRepository.count());
+        statistics.put("totalAppointments", allAppointments.size());
+        statistics.put("totalRevenue", totalRevenue);
+        statistics.put("monthlyAppointments", monthlyAppointments);
+        statistics.put("monthlyRevenue", monthlyRevenue);
+
+        Map<String, Object> appointmentStatuses = new LinkedHashMap<>();
+        appointmentStatuses.put("PENDING", allAppointments.stream().filter(a -> a.getStatus() == AppointmentStatus.PENDING).count());
+        appointmentStatuses.put("CONFIRMED", allAppointments.stream().filter(a -> a.getStatus() == AppointmentStatus.CONFIRMED).count());
+        appointmentStatuses.put("COMPLETED", allAppointments.stream().filter(a -> a.getStatus() == AppointmentStatus.COMPLETED).count());
+        appointmentStatuses.put("CANCELLED", allAppointments.stream().filter(a -> a.getStatus() == AppointmentStatus.CANCELLED).count());
+        statistics.put("appointmentStatuses", appointmentStatuses);
+
+        return ResponseEntity.ok(Map.of("statistics", statistics));
+    }
+
+    @GetMapping("/doctors")
+    public ResponseEntity<PageResponseDTO<Map<String, Object>>> listDoctors(
+        @RequestParam(defaultValue = "1") int page,
+        @RequestParam(defaultValue = "20") int limit,
+        @RequestParam(required = false) String search
+    ) {
+        List<Doctor> doctors = doctorRepository.findAll().stream()
+            .sorted((a, b) -> Long.compare(b.getId() == null ? 0 : b.getId(), a.getId() == null ? 0 : a.getId()))
+            .collect(java.util.stream.Collectors.toList());
+        if (search != null && !search.isBlank()) {
+            String like = search.toLowerCase();
+            doctors = doctors
+                .stream()
+                .filter(
+                    d ->
+                        (d.getFullName() != null && d.getFullName().toLowerCase().contains(like)) ||
+                        (d.getEmail() != null && d.getEmail().toLowerCase().contains(like))
+                )
+                .toList();
+        }
+        Page<Doctor> pageData = new org.springframework.data.domain.PageImpl<>(
+            slice(doctors, page, limit),
+            PageRequest.of(Math.max(page - 1, 0), limit),
+            doctors.size()
+        );
+        List<Map<String, Object>> data = pageData.getContent().stream().map(this::doctorSummary).toList();
+        return ResponseEntity.ok(
+            new PageResponseDTO<>(data, new PaginationDTO(page, limit, pageData.getTotalElements(), pageData.getTotalPages()))
+        );
+    }
+
+    @GetMapping("/doctors/{id}")
+    public ResponseEntity<Map<String, Object>> getDoctor(@PathVariable Long id) {
+        Doctor doctor = doctorRepository.findById(id).orElseThrow(() -> new IllegalStateException("Doctor not found"));
+        return ResponseEntity.ok(doctorDetail(doctor));
+    }
+
+    @PostMapping("/doctors")
+    public ResponseEntity<Map<String, Object>> createDoctor(@Valid @RequestBody DoctorRequest request) {
+        Doctor doctor = new Doctor();
+        applyDoctorRequest(doctor, request);
+        Doctor savedDoctor = doctorRepository.save(doctor);
+        return ResponseEntity.status(HttpStatus.CREATED).body(
+            Map.of("message", "Doctor added successfully", "doctor", doctorDetail(savedDoctor))
+        );
+    }
+
+    @PutMapping("/doctors/{id}")
+    public ResponseEntity<Map<String, Object>> updateDoctor(@PathVariable Long id, @Valid @RequestBody DoctorRequest request) {
+        Doctor doctor = doctorRepository.findById(id).orElseThrow(() -> new IllegalStateException("Doctor not found"));
+        applyDoctorRequest(doctor, request);
+        Doctor savedDoctor = doctorRepository.save(doctor);
+        return ResponseEntity.ok(Map.of("message", "Doctor updated successfully", "doctor", doctorDetail(savedDoctor)));
+    }
+
+    @PutMapping("/doctors/{id}/status")
+    public ResponseEntity<Map<String, Object>> updateDoctorStatus(@PathVariable Long id, @RequestBody DoctorStatusRequest request) {
+        Doctor doctor = doctorRepository.findById(id).orElseThrow(() -> new IllegalStateException("Doctor not found"));
+        Boolean active = request.isActive() != null ? request.isActive() : request.active();
+        boolean newActive = active != null ? active : true;
+        doctor.setActive(newActive);
+        Doctor savedDoctor = doctorRepository.save(doctor);
+        // Sync User account activated status with doctor active status
+        userRepository.findOneByEmailIgnoreCase(doctor.getEmail()).ifPresent(doctorUser -> {
+            doctorUser.setActivated(newActive);
+            userRepository.save(doctorUser);
+        });
+        return ResponseEntity.ok(Map.of("message", "Doctor status updated successfully", "doctor", doctorDetail(savedDoctor)));
+    }
+
+    @DeleteMapping("/doctors/{id}")
+    public ResponseEntity<Map<String, Object>> deleteDoctor(@PathVariable Long id) {
+        // Soft-delete: delegate to deactivate which cancels appointments and notifies patients
+        return deactivateDoctor(id);
+    }
+
+    @PostMapping("/doctors/{id}/deactivate")
+    public ResponseEntity<Map<String, Object>> deactivateDoctor(@PathVariable Long id) {
+        Doctor doctor = doctorRepository.findById(id).orElseThrow(() -> new IllegalStateException("Doctor not found"));
+        doctor.setActive(false);
+        doctorRepository.save(doctor);
+
+        // Sync: also deactivate the corresponding User account
+        userRepository.findOneByEmailIgnoreCase(doctor.getEmail()).ifPresent(doctorUser -> {
+            doctorUser.setActivated(false);
+            userRepository.save(doctorUser);
+        });
+
+        List<Appointment> activeAppointments = appointmentRepository.findByDoctorId(doctor.getId())
+            .stream()
+            .filter(a -> a.getStatus() == AppointmentStatus.PENDING || a.getStatus() == AppointmentStatus.CONFIRMED)
+            .toList();
+
+        for (Appointment appointment : activeAppointments) {
+            appointment.setStatus(AppointmentStatus.CANCELLED);
+            appointment.setNotes(
+                (appointment.getNotes() == null ? "" : appointment.getNotes() + "\n") +
+                "[SYSTEM]: Doctor is no longer available."
+            );
+            appointmentRepository.save(appointment);
+
+            if (appointment.getUser() != null) {
+                notificationService.createNotification(
+                    appointment.getUser().getId(),
+                    "Doctor Unavailable",
+                    "Your appointment with Dr. " + doctor.getFullName() +
+                    " has been cancelled because the doctor is currently unavailable. " +
+                    "Please book with another doctor — there is no extra charge and you may find an even better match for your needs.",
+                    "DOCTOR_UNAVAILABLE",
+                    appointment.getId()
+                );
+            }
+        }
+
+        return ResponseEntity.ok(Map.of(
+            "message", "Doctor deactivated successfully",
+            "cancelledAppointments", activeAppointments.size()
+        ));
+    }
+
+    @GetMapping("/appointments")
+    public ResponseEntity<PageResponseDTO<Map<String, Object>>> listAppointments(
+        @RequestParam(defaultValue = "1") int page,
+        @RequestParam(defaultValue = "20") int limit,
+        @RequestParam(required = false) String status,
+        @RequestParam(defaultValue = "date") String sortBy
+    ) {
+        List<Appointment> appointments = appointmentRepository.findAll();
+        if (status != null && !status.isBlank()) {
+            appointments = appointments
+                .stream()
+                .filter(a -> a.getStatus() != null && a.getStatus().name().equalsIgnoreCase(status))
+                .toList();
+        }
+        appointments = appointments.stream().sorted((a, b) -> a.getAppointmentDate().compareTo(b.getAppointmentDate())).toList();
+        Page<Appointment> pageData = new org.springframework.data.domain.PageImpl<>(
+            slice(appointments, page, limit),
+            PageRequest.of(Math.max(page - 1, 0), limit),
+            appointments.size()
+        );
+        List<Map<String, Object>> data = pageData.getContent().stream().map(this::appointmentSummary).toList();
+        return ResponseEntity.ok(
+            new PageResponseDTO<>(data, new PaginationDTO(page, limit, pageData.getTotalElements(), pageData.getTotalPages()))
+        );
+    }
+
+    @PutMapping("/appointments/{id}")
+    public ResponseEntity<Map<String, Object>> updateAppointment(
+        @PathVariable Long id,
+        @RequestBody UpdateAppointmentStatusRequest request
+    ) {
+        Appointment appointment = appointmentRepository.findById(id).orElseThrow(() -> new IllegalStateException("Appointment not found"));
+        AppointmentStatus newStatus;
+        try {
+            newStatus = AppointmentStatus.valueOf(request.status());
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Invalid status: " + request.status()));
+        }
+        AppointmentStatus current = appointment.getStatus();
+        if (current == AppointmentStatus.CANCELLED && newStatus != AppointmentStatus.CANCELLED) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Cannot change status of a cancelled appointment"));
+        }
+        if (current == AppointmentStatus.COMPLETED && newStatus == AppointmentStatus.PENDING) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Cannot revert a completed appointment to pending"));
+        }
+        appointment.setStatus(newStatus);
+        appointmentRepository.save(appointment);
+
+        if (appointment.getUser() != null) {
+            String statusMsg = "";
+            if ("CONFIRMED".equals(request.status())) statusMsg = "has been confirmed";
+            else if ("CANCELLED".equals(request.status())) statusMsg = "has been cancelled";
+            else if ("COMPLETED".equals(request.status())) statusMsg = "has been completed";
+            
+            if (!statusMsg.isEmpty()) {
+                notificationService.createNotification(
+                    appointment.getUser().getId(),
+                    "Appointment Update",
+                    "Your appointment at " + appointment.getAppointmentTime() + " on " + appointment.getAppointmentDate() + " " + statusMsg + ".",
+                    "APPOINTMENT_" + request.status(),
+                    appointment.getId()
+                );
+            }
+        }
+
+        return ResponseEntity.ok(
+            Map.of("id", id, "status", appointment.getStatus().name(), "message", "Appointment status updated successfully")
+        );
+    }
+
+    private Map<String, Object> doctorSummary(Doctor doctor) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("id", doctor.getId());
+        map.put("fullName", doctor.getFullName());
+        map.put("email", doctor.getEmail());
+        map.put("specialty", doctor.getSpecialty() != null ? doctor.getSpecialty().getName() : null);
+        map.put("hospital", doctor.getHospital() != null ? doctor.getHospital().getName() : null);
+        map.put("appointments", appointmentRepository.countByDoctorId(doctor.getId()));
+        map.put("rating", doctor.getRating());
+        map.put("active", doctor.getActive() == null ? true : doctor.getActive());
+        map.put("isAvailable", doctor.getActive() == null ? true : doctor.getActive());
+        return map;
+    }
+
+    private Map<String, Object> doctorDetail(Doctor doctor) {
+        Map<String, Object> specialty = new LinkedHashMap<>();
+        if (doctor.getSpecialty() != null) {
+            specialty.put("id", doctor.getSpecialty().getId());
+            specialty.put("name", doctor.getSpecialty().getName());
+            specialty.put("vietnamName", doctor.getSpecialty().getVietnamName());
+        }
+
+        Map<String, Object> hospital = new LinkedHashMap<>();
+        if (doctor.getHospital() != null) {
+            hospital.put("id", doctor.getHospital().getId());
+            hospital.put("name", doctor.getHospital().getName());
+            hospital.put("address", doctor.getHospital().getAddress());
+            hospital.put("phone", doctor.getHospital().getPhone());
+            hospital.put("email", doctor.getHospital().getEmail());
+        }
+
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("id", doctor.getId());
+        map.put("fullName", doctor.getFullName());
+        map.put("email", doctor.getEmail());
+        map.put("phoneNumber", doctor.getPhoneNumber());
+        map.put("bio", doctor.getBio());
+        map.put("avatar", doctor.getAvatar());
+        map.put("experience", doctor.getExperience());
+        map.put("license", doctor.getLicense());
+        map.put("price", doctor.getPrice());
+        map.put("rating", doctor.getRating());
+        map.put("reviewCount", doctor.getReviewCount());
+        map.put("active", doctor.getActive() == null ? true : doctor.getActive());
+        map.put("isAvailable", doctor.getActive() == null ? true : doctor.getActive());
+        map.put("specialty", specialty);
+        map.put("hospital", hospital);
+        map.put("appointments", appointmentRepository.countByDoctorId(doctor.getId()));
+        return map;
+    }
+
+    private Map<String, Object> appointmentSummary(Appointment appointment) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put("id", appointment.getId());
+        map.put("userId", appointment.getUser() != null ? appointment.getUser().getId() : null);
+        if (appointment.getUser() != null) {
+            String firstName = appointment.getUser().getFirstName();
+            String lastName = appointment.getUser().getLastName();
+            String fullName = ((firstName != null ? firstName : "") + " " + (lastName != null ? lastName : "")).trim();
+            map.put("userName", fullName.isEmpty() ? appointment.getUser().getLogin() : fullName);
+        } else {
+            map.put("userName", null);
+        }
+        map.put("doctorId", appointment.getDoctor() != null ? appointment.getDoctor().getId() : null);
+        map.put("doctorName", appointment.getDoctor() != null ? appointment.getDoctor().getFullName() : null);
+        map.put("appointmentDate", appointment.getAppointmentDate());
+        map.put("appointmentTime", appointment.getAppointmentTime());
+        map.put("status", appointment.getStatus() != null ? appointment.getStatus().name() : null);
+        map.put("price", appointment.getPrice());
+        map.put("paymentStatus", appointment.getPaymentStatus());
+        return map;
+    }
+
+    private void applyDoctorRequest(Doctor doctor, DoctorRequest request) {
+        doctor.setFullName(request.fullName().trim());
+        doctor.setEmail(request.email());
+        doctor.setPhoneNumber(request.phoneNumber());
+        doctor.setBio(request.bio());
+        doctor.setAvatar(request.avatar());
+        doctor.setExperience(request.experience());
+        doctor.setLicense(request.license());
+        doctor.setPrice(request.price());
+        doctor.setRating(request.rating());
+        doctor.setReviewCount(request.reviewCount());
+        doctor.setActive(request.active() != null ? request.active() : (doctor.getActive() == null ? true : doctor.getActive()));
+
+        Specialty specialty = specialtyRepository
+            .findById(request.specialtyId())
+            .orElseThrow(() -> new IllegalStateException("Specialty not found"));
+        Hospital hospital = hospitalRepository
+            .findById(request.hospitalId())
+            .orElseThrow(() -> new IllegalStateException("Hospital not found"));
+
+        doctor.setSpecialty(specialty);
+        doctor.setHospital(hospital);
+    }
+
+    private <T> List<T> slice(List<T> items, int page, int limit) {
+        int fromIndex = Math.min(Math.max(page - 1, 0) * limit, items.size());
+        int toIndex = Math.min(fromIndex + limit, items.size());
+        return fromIndex >= toIndex ? List.of() : items.subList(fromIndex, toIndex);
+    }
+
+    public record UpdateAppointmentStatusRequest(String status) {}
+
+    public record DoctorRequest(
+        @NotBlank String fullName,
+        String email,
+        String phoneNumber,
+        String bio,
+        String avatar,
+        Integer experience,
+        String license,
+        Long price,
+        Double rating,
+        Integer reviewCount,
+        Boolean active,
+        @NotNull Long specialtyId,
+        @NotNull Long hospitalId
+    ) {}
+
+    public record DoctorStatusRequest(Boolean isActive, Boolean active) {}
+}
